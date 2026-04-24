@@ -1,0 +1,92 @@
+name: Sync Upstream + Notify
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/msitarzewski/agency-agents.git
+          git fetch upstream
+
+      - name: Check for new commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list HEAD..upstream/main --count)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          if [ "$BEHIND" -gt "0" ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge and push
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          git merge upstream/main --no-edit
+          git push origin main
+
+      - name: Build and send Telegram notification
+        if: steps.check.outputs.has_updates == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, subprocess, urllib.request, urllib.parse
+
+          behind = os.environ["BEHIND"]
+          result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD~" + behind, "HEAD"],
+            capture_output=True, text=True
+          )
+          changed = result.stdout.strip().splitlines()
+
+          KEYWORDS = ("sales", "real_estate", "realest", "b2b", "outbound",
+                      "qualifier", "proposal", "crm", "specialist", "finance",
+                      "marketing", "lead")
+          relevant = [f for f in changed if any(k in f.lower() for k in KEYWORDS)]
+
+          lines = [f"agency-agents -- {behind} new commit(s) merged\n"]
+          if changed:
+            sample = changed[:15]
+            lines.append("Changed files:\n" + "\n".join(sample))
+            if len(changed) > 15:
+              lines.append(f"...and {len(changed)-15} more")
+          if relevant:
+            lines.append("\nRelevant to Porsynth:\n" + "\n".join(relevant))
+          lines.append("\nhttps://github.com/icporcincula/agency-agents")
+
+          msg = "\n".join(lines)
+          print(msg)
+
+          payload = urllib.parse.urlencode({
+            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+            "text": msg,
+            "disable_web_page_preview": "true",
+          }).encode()
+          req = urllib.request.Request(
+            f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+            data=payload,
+          )
+          with urllib.request.urlopen(req, timeout=10) as r:
+            print("Telegram:", r.read().decode())
+          PYEOF
